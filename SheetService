@@ -1,0 +1,242 @@
+/**
+ * Сервис для работы с Google Таблицей.
+ * Содержит все методы для чтения/записи данных.
+ * Использует кэширование для оптимизации.
+ */
+
+// Глобальный кэш для данных таблицы
+const sheetCache = {};
+
+/**
+ * Получает данные листа с кэшированием
+ * @param {string} sheetName - Имя листа
+ * @returns {Array<Array>} Данные листа в виде двумерного массива
+ */
+function getSheetData(sheetName) {
+  const cacheKey = `sheet_${sheetName}`;
+  const cache = CacheService.getScriptCache();
+  
+  // Пробуем получить из кэша
+  const cachedData = cache.get(cacheKey);
+  if (cachedData) {
+    if (CONFIG.LOGGING.ENABLE_INFO_LOGS) {
+      console.log(`${CONFIG.LOGGING.INFO_LOG_PREFIX} Данные из кэша: ${sheetName}`);
+    }
+    return JSON.parse(cachedData);
+  }
+  
+  // Читаем из таблицы
+  const spreadsheet = getSpreadsheet();
+  const sheet = spreadsheet.getSheetByName(sheetName);
+  
+  if (!sheet) {
+    throw new Error(`Лист "${sheetName}" не найден`);
+  }
+  
+  // Получаем все данные (включая заголовки)
+  const data = sheet.getDataRange().getValues();
+  
+  // Сохраняем в кэш
+  cache.put(cacheKey, JSON.stringify(data), CONFIG.CACHE_TTL);
+  
+  if (CONFIG.LOGGING.ENABLE_INFO_LOGS) {
+    console.log(`${CONFIG.LOGGING.INFO_LOG_PREFIX} Данные загружены в кэш: ${sheetName}`);
+  }
+  
+  return data;
+}
+
+/**
+ * Очищает кэш для указанного листа
+ * @param {string} sheetName - Имя листа
+ */
+function clearSheetCache(sheetName) {
+  const cacheKey = `sheet_${sheetName}`;
+  CacheService.getScriptCache().remove(cacheKey);
+  
+  if (CONFIG.LOGGING.ENABLE_INFO_LOGS) {
+    console.log(`${CONFIG.LOGGING.INFO_LOG_PREFIX} Кэш очищен: ${sheetName}`);
+  }
+}
+
+/**
+ * Ищет пользователя по Telegram ID
+ * @param {number} telegramId - Telegram ID пользователя
+ * @returns {Object|null} Объект пользователя или null если не найден
+ */
+function getUserByTelegramId(telegramId) {
+  try {
+    const data = getSheetData(CONFIG.SHEET_NAMES.REFERENCE);
+    
+    // Пропускаем заголовок (первую строку)
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      const rowTelegramId = row[CONFIG.REF_COLS.TG_ID - 1];
+      
+      // Проверяем совпадение Telegram ID
+      if (rowTelegramId && rowTelegramId.toString() === telegramId.toString()) {
+        return {
+          name: row[CONFIG.REF_COLS.USER - 1],
+          telegramId: rowTelegramId,
+          rowIndex: i + 1 // +1 потому что индексы в таблице начинаются с 1
+        };
+      }
+    }
+    
+    return null;
+    
+  } catch (error) {
+    logError('Ошибка при поиске пользователя:', error);
+    return null;
+  }
+}
+
+/**
+ * Получает статьи по префиксу категории
+ * @param {string} prefix - Префикс для фильтрации (dohod_, rashod1_ и т.д.)
+ * @returns {Array<Object>} Массив статей с кодом и названием
+ */
+function getFilteredItems(prefix) {
+  try {
+    const data = getSheetData(CONFIG.SHEET_NAMES.REFERENCE);
+    const items = [];
+    
+    // Пропускаем заголовок
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      const code = row[CONFIG.REF_COLS.CODE - 1];
+      const itemName = row[CONFIG.REF_COLS.ITEM - 1];
+      
+      // Проверяем префикс кода и что название не пустое
+      if (code && itemName && code.toString().startsWith(prefix)) {
+        items.push({
+          code: code.toString(),
+          name: itemName.toString(),
+          type: row[CONFIG.REF_COLS.TYPE - 1]?.toString() || ''
+        });
+      }
+    }
+    
+    if (CONFIG.LOGGING.ENABLE_INFO_LOGS) {
+      console.log(`${CONFIG.LOGGING.INFO_LOG_PREFIX} Найдено статей для префикса "${prefix}": ${items.length}`);
+    }
+    
+    return items;
+    
+  } catch (error) {
+    logError('Ошибка при получении статей:', error);
+    return [];
+  }
+}
+
+/**
+ * Получает уникальные кошельки из справочника
+ * @returns {Array<string>} Массив уникальных кошельков
+ */
+function getAllWallets() {
+  try {
+    const data = getSheetData(CONFIG.SHEET_NAMES.REFERENCE);
+    const walletsSet = new Set();
+    
+    // Пропускаем заголовок
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      const walletsCell = row[CONFIG.REF_COLS.WALLET - 1];
+      
+      if (walletsCell) {
+        // Разбиваем строку по запятым и добавляем каждый кошелек
+        const wallets = walletsCell.toString().split(',').map(w => w.trim());
+        wallets.forEach(wallet => {
+          if (wallet) walletsSet.add(wallet);
+        });
+      }
+    }
+    
+    const wallets = Array.from(walletsSet);
+    
+    if (CONFIG.LOGGING.ENABLE_INFO_LOGS) {
+      console.log(`${CONFIG.LOGGING.INFO_LOG_PREFIX} Найдено кошельков: ${wallets.length}`);
+    }
+    
+    return wallets;
+    
+  } catch (error) {
+    logError('Ошибка при получении кошельков:', error);
+    return [];
+  }
+}
+
+/**
+ * Добавляет запись в журнал операций
+ * @param {Object} record - Объект с данными записи
+ * @returns {boolean} true если успешно, false если ошибка
+ */
+function appendJournalRecord(record) {
+  try {
+    const spreadsheet = getSpreadsheet();
+    const sheet = spreadsheet.getSheetByName(CONFIG.SHEET_NAMES.JOURNAL);
+    
+    if (!sheet) {
+      throw new Error(`Лист "${CONFIG.SHEET_NAMES.JOURNAL}" не найден`);
+    }
+    
+    // Находим первую пустую строку
+    const lastRow = sheet.getLastRow();
+    const targetRow = lastRow + 1;
+    
+    // Подготавливаем данные для записи
+    const rowData = new Array(10).fill(''); // 10 колонок в журнале
+    
+    // Заполняем колонки согласно структуре
+    // A, B, C - не заполняются (оставляем пустыми)
+    // D - Дата оплаты факт (сегодня)
+    rowData[CONFIG.JRN_COLS.DATE_FACT - 1] = new Date();
+    
+    // E или F - Приход/Расход
+    if (record.isIncome) {
+      rowData[CONFIG.JRN_COLS.INCOME - 1] = parseFloat(record.amount.replace(',', '.'));
+      rowData[CONFIG.JRN_COLS.EXPENSE - 1] = '';
+    } else {
+      rowData[CONFIG.JRN_COLS.INCOME - 1] = '';
+      rowData[CONFIG.JRN_COLS.EXPENSE - 1] = parseFloat(record.amount.replace(',', '.'));
+    }
+    
+    // G - Комментарий
+    rowData[CONFIG.JRN_COLS.COMMENT - 1] = record.comment || '';
+    
+    // H - Статья учета
+    rowData[CONFIG.JRN_COLS.ACCOUNT_ITEM - 1] = record.itemName;
+    
+    // I - Кошелек
+    rowData[CONFIG.JRN_COLS.WALLET - 1] = record.wallet;
+    
+    // J - Пользователь
+    rowData[CONFIG.JRN_COLS.USER - 1] = record.userName;
+    
+    // Записываем данные
+    sheet.getRange(targetRow, 1, 1, rowData.length).setValues([rowData]);
+    
+    // Форматируем дату
+    sheet.getRange(targetRow, CONFIG.JRN_COLS.DATE_FACT).setNumberFormat('dd.mm.yyyy');
+    
+    // Форматируем сумму
+    if (record.isIncome) {
+      sheet.getRange(targetRow, CONFIG.JRN_COLS.INCOME).setNumberFormat('#,##0.00');
+    } else {
+      sheet.getRange(targetRow, CONFIG.JRN_COLS.EXPENSE).setNumberFormat('#,##0.00');
+    }
+    
+    // Очищаем кэш журнала
+    clearSheetCache(CONFIG.SHEET_NAMES.JOURNAL);
+    
+    if (CONFIG.LOGGING.ENABLE_INFO_LOGS) {
+      console.log(`${CONFIG.LOGGING.INFO_LOG_PREFIX} Запись добавлена в строку ${targetRow}:`, record);
+    }
+    
+    return true;
+    
+  } catch (error) {
+    logError('Ошибка при добавлении записи в журнал:', error);
+    return false;
+  }
+}
